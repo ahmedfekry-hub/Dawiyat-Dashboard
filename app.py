@@ -304,8 +304,15 @@ def load_data(file_source=None):
             penalties["Region"] = np.nan
         pen_map = data[["Link Code","City","District","Region"]].drop_duplicates()
         penalties = penalties.merge(pen_map, on="Link Code", how="left", suffixes=("", "_main"))
-        penalties["City"] = penalties.get("City").combine_first(penalties.get("City_main"))
-        penalties["Region"] = penalties.get("Region").combine_first(penalties.get("Region_main"))
+        # Safe fill for penalties dimensions even when original columns do not exist
+        if "City" not in penalties.columns:
+            penalties["City"] = pd.Series([pd.NA] * len(penalties), index=penalties.index, dtype="object")
+        if "Region" not in penalties.columns:
+            penalties["Region"] = pd.Series([pd.NA] * len(penalties), index=penalties.index, dtype="object")
+        if "City_main" in penalties.columns:
+            penalties["City"] = penalties["City"].combine_first(penalties["City_main"])
+        if "Region_main" in penalties.columns:
+            penalties["Region"] = penalties["Region"].combine_first(penalties["Region_main"])
         penalties["City"] = penalties["City"].fillna("Not Classified")
         penalties["Region"] = penalties["Region"].fillna("Not Classified")
         if p_name and p_name != "Deviation name":
