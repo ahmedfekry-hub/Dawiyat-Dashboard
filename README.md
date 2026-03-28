@@ -1,23 +1,21 @@
-# Dawiyat Executive PMO Dashboard
 
-This package contains the refreshed Streamlit dashboard for the Dawiyat project.
+# Dawiyat Project Intelligence Dashboard
 
-## Files to upload to GitHub
-- `app.py`
-- `requirements.txt`
-- `README.md`
-- `Dawiyat Master Sheet.xlsx`
+Upload these files to GitHub:
+- app.py
+- requirements.txt
+- README.md
+- Dawiyat Master Sheet.xlsx
 
 Do not upload `__pycache__`.
 
-## Main updates in this version
-- Returned to the original professional executive dashboard style
-- Removed CPI and SPI from all KPI cards, charts, and detail tables
-- Uses the latest updated workbook and penalties sheet
-- Fixed city and district mapping using the District sheet and link-code fallback
-- Added Link Code as a cascading filter
-- Preserved dark and light themes
-- Preserved daily refresh through workbook upload in the sidebar
+## Features
+- Executive overview with dark/light theme
+- Cascading filters
+- PMO summary page
+- Penalties and quality analysis
+- Workorder detail export to Excel and CSV
+- Dashboard guide for KPI calculation logic
 
 ## Run locally
 ```bash
