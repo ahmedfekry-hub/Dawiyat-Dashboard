@@ -1,6 +1,5 @@
 
 from __future__ import annotations
-
 from io import BytesIO
 from pathlib import Path
 import numpy as np
@@ -9,919 +8,612 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(
-    page_title="Dawiyat Project Intelligence Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Dawiyat Executive Dashboard", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
 DEFAULT_FILE = "Dawiyat Master Sheet.xlsx"
 
+def clean_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
-# ---------------------- helpers ----------------------
-def clean_text(value):
-    if pd.isna(value):
-        return np.nan
-    text = str(value).strip()
-    return np.nan if text in {"", "nan", "None", "null"} else text
+def find_sheet(xls: pd.ExcelFile, candidates: list[str]) -> str | None:
+    normalized = {str(name).strip().lower(): name for name in xls.sheet_names}
+    for c in candidates:
+        if c.strip().lower() in normalized:
+            return normalized[c.strip().lower()]
+    for name in xls.sheet_names:
+        low = str(name).strip().lower()
+        if any(c.strip().lower() in low for c in candidates):
+            return name
+    return None
 
-
-def first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
+def first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     norm = {str(c).strip().lower(): c for c in df.columns}
-    for name in names:
-        if name.strip().lower() in norm:
-            return norm[name.strip().lower()]
+    for c in candidates:
+        if c.strip().lower() in norm:
+            return norm[c.strip().lower()]
     for c in df.columns:
         low = str(c).strip().lower()
-        if any(name.strip().lower() in low for name in names):
+        if any(x.strip().lower() in low for x in candidates):
             return c
     return None
 
-
-def choose_mode(series: pd.Series):
-    series = series.dropna()
-    if series.empty:
-        return np.nan
-    mode = series.mode(dropna=True)
-    return mode.iloc[0] if not mode.empty else series.iloc[0]
-
-
-def ratio_pct(progress, scope):
-    p = pd.to_numeric(progress, errors="coerce")
-    s = pd.to_numeric(scope, errors="coerce")
-    with np.errstate(divide="ignore", invalid="ignore"):
-        out = np.where(s > 0, (p / s) * 100, np.nan)
-    return pd.Series(out, index=p.index).clip(lower=0, upper=100)
-
-
-def safe_numeric(series, default=0):
-    if isinstance(series, (int, float)):
-        return pd.Series([series])
-    if series is None:
-        return pd.Series(dtype="float64")
-    return pd.to_numeric(series, errors="coerce").fillna(default)
-
-
-def safe_series(df: pd.DataFrame, col: str, default=np.nan):
+def series_or_default(df: pd.DataFrame, col: str, default=np.nan):
     if col in df.columns:
         return df[col]
     return pd.Series([default] * len(df), index=df.index)
 
+def to_num(s):
+    return pd.to_numeric(s, errors="coerce")
 
-def coalesce_into(df: pd.DataFrame, target: str, *fallbacks: str):
-    if target not in df.columns:
-        df[target] = np.nan
-    result = df[target].copy()
-    for fb in fallbacks:
-        if fb in df.columns:
-            result = result.combine_first(df[fb])
-    df[target] = result
-    return df[target]
+def pct_ratio(progress, scope):
+    p = to_num(progress)
+    s = to_num(scope)
+    out = np.where(s > 0, (p / s) * 100, np.nan)
+    return pd.Series(out, index=p.index).clip(lower=0, upper=150)
 
+def effective_date(df: pd.DataFrame):
+    upd = pd.to_datetime(series_or_default(df, "Updated Target Date"), errors="coerce")
+    tgt = pd.to_datetime(series_or_default(df, "Targeted Completion"), errors="coerce")
+    return upd.combine_first(tgt)
+
+def map_region(raw_region):
+    txt = "" if pd.isna(raw_region) else str(raw_region).strip().upper()
+    if txt in {"MAKKAH", "MECCA", "TABUK", "BAHA", "MADINAH", "MEDINA", "WESTERN"}:
+        return "Western"
+    if txt in {"JIZAN", "NAJRAN", "ABHA", "KHAMIS", "BISHA", "SOUTHERN"}:
+        return "Southern"
+    if txt in {"EASTERN REGION", "EASTERN", "DAMMAM", "KHOBAR", "JUBAIL", "HASA"}:
+        return "Eastern"
+    if txt in {"NORTHERN", "AL JOUF", "ARAR", "HAIL"}:
+        return "Northern"
+    return "Not Classified"
+
+def risk_bucket(row):
+    pct = row.get("Percentage of Completion", np.nan)
+    eff = row.get("Effective Target Date", pd.NaT)
+    if pd.isna(eff):
+        return "No target date"
+    days = (pd.Timestamp.today().normalize() - pd.Timestamp(eff).normalize()).days
+    if pd.notna(pct) and pct >= 100:
+        return "Completed"
+    if days > 30:
+        return "High delay risk"
+    if days > 0:
+        return "Moderate delay risk"
+    if days >= -14:
+        return "Watchlist"
+    return "On forecast"
 
 def fmt_money(x):
     if pd.isna(x):
         return "-"
     x = float(x)
     if abs(x) >= 1_000_000:
-        return f"SAR {x/1_000_000:,.2f}M"
+        return f"SAR {x/1_000_000:.2f}M"
     if abs(x) >= 1_000:
-        return f"SAR {x/1_000:,.1f}K"
-    return f"SAR {x:,.0f}"
-
+        return f"SAR {x/1_000:.1f}K"
+    return f"SAR {x:.0f}"
 
 def fmt_pct(x):
-    return "-" if pd.isna(x) else f"{x:,.1f}%"
+    return "-" if pd.isna(x) else f"{float(x):.1f}%"
 
+def add_card(title, value, subtitle=""):
+    st.markdown(f"""
+    <div class="metric-card">
+      <div class="metric-title">{title}</div>
+      <div class="metric-value">{value}</div>
+      <div class="metric-subtitle">{subtitle}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-def add_card(title: str, value: str, subtitle: str = ""):
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-title">{title}</div>
-            <div class="metric-value">{value}</div>
-            <div class="metric-subtitle">{subtitle}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Export") -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+def to_excel_bytes(df, sheet_name="Export"):
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-    output.seek(0)
-    return output.getvalue()
+    bio.seek(0)
+    return bio.getvalue()
 
-
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-
-def normalize_region(old_region, city):
-    text = str(old_region).strip().upper() if pd.notna(old_region) else ""
-    ctext = str(city).strip().upper() if pd.notna(city) else ""
-
-    west_tokens = {"MAKKAH", "MECCA", "BAHA", "AL BAHA", "MADINAH", "MEDINA", "TABUK", "WESTERN"}
-    south_tokens = {"JIZAN", "NAJRAN", "ABHA", "KHAMIS", "BISHA", "SOUTHERN"}
-    east_tokens = {"EASTERN", "EASTERN REGION", "DAMMAM", "KHOBAR", "JUBAIL", "HASA"}
-    north_tokens = {"NORTHERN", "AL JOUF", "ARAR", "HAIL", "QURAYAT", "TURAIF"}
-
-    west_cities = {"JEDDAH", "TAIF", "AL BAHA", "BAHA", "TABUK", "MADINAH", "MEDINA", "MAKKAH"}
-    south_cities = {"JIZAN", "ABHA", "NAJRAN", "KHAMIS MUSHAIT", "BISHA"}
-    east_cities = {"DAMMAM", "KHOBAR", "JUBAIL", "AL AHSA", "HOFUF"}
-    north_cities = {"ARAR", "SAKAKA", "JOUF", "AL JOUF", "HAIL", "QURAYAT", "TURAIF"}
-
-    if text in west_tokens or ctext in west_cities:
-        return "Western"
-    if text in south_tokens or ctext in south_cities:
-        return "Southern"
-    if text in east_tokens or ctext in east_cities:
-        return "Eastern"
-    if text in north_tokens or ctext in north_cities:
-        return "Northern"
-    return "Not Classified"
-
-
-def apply_theme_css(theme_mode: str):
-    dark = theme_mode == "Dark"
-    bg = "#07111f" if dark else "#F3F7FC"
-    panel = "#091a31" if dark else "#FFFFFF"
-    card = "#0f1f38" if dark else "#FFFFFF"
-    text = "#ECF3FF" if dark else "#16253B"
-    muted = "#94A9C7" if dark else "#667085"
-    border = "rgba(148,163,184,0.16)" if dark else "rgba(15,23,42,0.08)"
-    glow = "0 10px 30px rgba(59,130,246,0.18)" if dark else "0 10px 26px rgba(15,23,42,0.06)"
-    st.markdown(
-        f"""
-        <style>
-        .stApp {{
-            background:
-                radial-gradient(circle at top left, rgba(59,130,246,0.18), transparent 28%),
-                radial-gradient(circle at top right, rgba(245,158,11,0.10), transparent 22%),
-                {bg};
-            color: {text};
-        }}
-        .block-container {{padding-top: 0.9rem; padding-bottom: 2rem; max-width: 95rem;}}
-        section[data-testid="stSidebar"] {{
-            background: linear-gradient(180deg, #11264A 0%, #081426 100%);
-            border-right: 1px solid rgba(148,163,184,0.16);
-        }}
-        section[data-testid="stSidebar"] * {{ color: #ECF3FF !important; }}
-        .top-banner {{
-            background: linear-gradient(135deg, rgba(59,130,246,0.23), rgba(16,185,129,0.08), rgba(245,158,11,0.10));
-            border: 1px solid {border};
-            border-radius: 24px;
-            padding: 22px 24px;
-            margin-bottom: 14px;
-            box-shadow: {glow};
-        }}
-        .metric-card {{
-            background: linear-gradient(180deg, rgba(15,31,56,0.95), rgba(11,23,42,0.95));
-            border: 1px solid {border};
-            border-radius: 18px;
-            padding: 16px 18px 14px 18px;
-            min-height: 128px;
-            box-shadow: {glow};
-        }}
-        .metric-title {{ color: #9BB1D0; font-size: 0.92rem; margin-bottom: 6px; }}
-        .metric-value {{ color: #F8FBFF; font-size: 1.95rem; font-weight: 700; line-height: 1.15; margin-bottom: 8px; }}
-        .metric-subtitle {{ color: #8FA8CA; font-size: 0.88rem; }}
-        .section-card {{
-            background: {card};
-            border: 1px solid {border};
-            border-radius: 22px;
-            padding: 10px 14px 2px 14px;
-            box-shadow: {glow};
-        }}
-        .guide-box {{
-            background: {panel};
-            border-left: 4px solid #3B82F6;
-            border-radius: 14px;
-            border: 1px solid {border};
-            padding: 14px 16px;
-            margin: 10px 0px;
-        }}
-        .guide-title {{font-weight:700; margin-bottom:6px;}}
-        .subtle {{ color: {muted}; font-size: 0.95rem; }}
-        .small-chip {{
-            display:inline-block; padding: 6px 10px; border-radius: 999px;
-            background: rgba(59,130,246,0.12); color: {text}; font-size: 0.85rem;
-            border: 1px solid {border}; margin-right: 8px; margin-top: 4px;
-        }}
-        div[data-testid="stMetric"] {{
-            background: {card};
-            border: 1px solid {border};
-            padding: 12px 14px;
-            border-radius: 16px;
-            box-shadow: {glow};
-        }}
-        .stDataFrame, div[data-testid="stTable"] {{
-            border-radius: 16px; overflow: hidden; border: 1px solid {border};
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
+def style(theme: str):
+    dark = theme == "Dark"
+    bg = "#07111f" if dark else "#F2F6FB"
+    panel = "#0c1c33" if dark else "#FFFFFF"
+    card_bg = "linear-gradient(180deg, rgba(14,31,57,0.98), rgba(9,20,39,0.98))" if dark else "linear-gradient(180deg, #1B2E4D, #142742)"
+    txt = "#EAF2FF" if dark else "#16253B"
+    muted = "#9CB0CD" if dark else "#8FA1BC"
+    border = "rgba(148,163,184,0.18)" if dark else "rgba(15,23,42,0.08)"
+    body_card = "#0D1D35" if dark else "#FFFFFF"
+    st.markdown(f"""
+    <style>
+    .stApp {{
+      background:
+        radial-gradient(circle at top left, rgba(59,130,246,0.18), transparent 28%),
+        radial-gradient(circle at top right, rgba(249,115,22,0.10), transparent 18%),
+        {bg};
+      color: {txt};
+    }}
+    .block-container {{padding-top: 1rem; max-width: 95rem;}}
+    section[data-testid="stSidebar"] {{
+      background: linear-gradient(180deg, #13284A 0%, #0A1628 100%);
+      border-right: 1px solid rgba(148,163,184,0.16);
+    }}
+    section[data-testid="stSidebar"] * {{color:#ECF3FF !important;}}
+    .hero {{
+      background: linear-gradient(135deg, rgba(37,99,235,0.18), rgba(16,185,129,0.08), rgba(249,115,22,0.12));
+      border: 1px solid {border};
+      border-radius: 24px;
+      padding: 20px 24px;
+      margin-bottom: 10px;
+      box-shadow: 0 10px 24px rgba(15,23,42,0.08);
+    }}
+    .metric-card {{
+      background: {card_bg};
+      border: 1px solid {border};
+      border-radius: 20px;
+      padding: 16px 18px;
+      min-height: 130px;
+      box-shadow: 0 12px 24px rgba(15,23,42,0.08);
+    }}
+    .metric-title {{font-size: .95rem; color: #A8BADA; margin-bottom: 8px;}}
+    .metric-value {{font-size: 1.95rem; font-weight: 800; color: #FFFFFF; line-height: 1.1;}}
+    .metric-subtitle {{font-size: .90rem; color: #A8BADA; margin-top: 8px;}}
+    .panel {{
+      background: {body_card};
+      border: 1px solid {border};
+      border-radius: 22px;
+      padding: 14px 16px 8px 16px;
+      box-shadow: 0 12px 24px rgba(15,23,42,0.06);
+    }}
+    .guide-box {{
+      background: {panel};
+      border: 1px solid {border};
+      border-left: 4px solid #3B82F6;
+      border-radius: 16px;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+    }}
+    .small-note {{color:{muted}; font-size:0.92rem;}}
+    div[data-testid="stMetric"] {{
+      background: {body_card};
+      border: 1px solid {border};
+      border-radius: 16px;
+      padding: 8px 12px;
+    }}
+    .stTabs [data-baseweb="tab-list"] {{gap: 12px;}}
+    .stTabs [data-baseweb="tab"] {{
+      height: 46px;
+      white-space: pre-wrap;
+      border-radius: 10px 10px 0 0;
+      padding-left: 10px; padding-right: 10px;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
 
 @st.cache_data(show_spinner=False)
-def load_data(file_source=None):
-    if file_source is None:
-        file_source = Path(__file__).with_name(DEFAULT_FILE)
+def load_data(file_source):
     xls = pd.ExcelFile(file_source)
-
-    def find_sheet(candidates):
-        normalized = {str(name).strip().lower(): name for name in xls.sheet_names}
-        for c in candidates:
-            if c.strip().lower() in normalized:
-                return normalized[c.strip().lower()]
-        for name in xls.sheet_names:
-            low = str(name).strip().lower()
-            if any(c.strip().lower() in low for c in candidates):
-                return name
-        return None
-
-    main_name = find_sheet(["Dawaiyat Service Tool", "service tool"])
-    district_name = find_sheet(["District"])
-    penalties_name = find_sheet(["Penalties", "Penalty"])
-    detail_name = find_sheet(["Workorder details", "Workorder detail"])
-
+    main_name = find_sheet(xls, ["Dawaiyat Service Tool", "service tool"])
     if main_name is None:
-        raise ValueError("Main sheet 'Dawaiyat Service Tool' was not found.")
+        raise ValueError("Main sheet Dawaiyat Service Tool was not found.")
+    main = clean_cols(pd.read_excel(file_source, sheet_name=main_name))
 
-    main = pd.read_excel(file_source, sheet_name=main_name)
-    district = pd.read_excel(file_source, sheet_name=district_name) if district_name else pd.DataFrame()
-    penalties = pd.read_excel(file_source, sheet_name=penalties_name) if penalties_name else pd.DataFrame()
-    details = pd.read_excel(file_source, sheet_name=detail_name) if detail_name else pd.DataFrame()
+    district_name = find_sheet(xls, ["District"])
+    penalties_name = find_sheet(xls, ["Penalties", "Penalty"])
+    details_name = find_sheet(xls, ["Workorder details", "Workorder detail"])
 
-    for df in [main, district, penalties, details]:
-        if not df.empty:
-            df.columns = [str(c).strip() for c in df.columns]
-            for col in df.columns:
-                if df[col].dtype == "object":
-                    df[col] = df[col].map(clean_text)
+    district = clean_cols(pd.read_excel(file_source, sheet_name=district_name)) if district_name else pd.DataFrame()
+    penalties = clean_cols(pd.read_excel(file_source, sheet_name=penalties_name)) if penalties_name else pd.DataFrame()
+    details = clean_cols(pd.read_excel(file_source, sheet_name=details_name)) if details_name else main.copy()
 
-    link_col = first_existing(main, ["Link Code"])
-    workorder_col = first_existing(main, ["Work Order"])
-    if link_col is None:
-        raise ValueError("Column 'Link Code' not found in main sheet.")
-
-    main = main[main[link_col].notna()].copy()
-    main[link_col] = main[link_col].astype(str).str.strip()
-    main.rename(columns={link_col: "Link Code"}, inplace=True)
-    if workorder_col:
-        main.rename(columns={workorder_col: "Work Order"}, inplace=True)
-
-    # District mapping sheet
-    data = main.copy()
-    if not district.empty:
-        d_link = first_existing(district, ["Link Code"])
-        d_city = first_existing(district, ["City"])
-        d_dist = first_existing(district, ["District"])
-        d_region = first_existing(district, ["Region"])
-        if d_link:
-            district = district[district[d_link].notna()].copy()
-            district[d_link] = district[d_link].astype(str).str.strip()
-            agg = {}
-            if d_city:
-                agg["City"] = (d_city, choose_mode)
-            if d_dist:
-                agg["District"] = (d_dist, choose_mode)
-            if d_region:
-                agg["Region_sheet"] = (d_region, choose_mode)
-            district_map = district.groupby(d_link, dropna=False).agg(**agg).reset_index().rename(columns={d_link: "Link Code"})
-            data = data.merge(district_map, on="Link Code", how="left")
-
-            district["p1"] = district[d_link].astype(str).str.split("-").str[0].str.upper()
-            district["p3"] = district[d_link].astype(str).str.split("-").str[2].str.upper()
-            city_prefix_map = district.groupby("p1")[d_city].agg(choose_mode).dropna().to_dict() if d_city else {}
-            dist_prefix_map = district.groupby("p3")[d_dist].agg(choose_mode).dropna().to_dict() if d_dist else {}
-        else:
-            city_prefix_map, dist_prefix_map = {}, {}
-    else:
-        city_prefix_map, dist_prefix_map = {}, {}
-
-    data["p1"] = data["Link Code"].astype(str).str.split("-").str[0].str.upper()
-    data["p3"] = data["Link Code"].astype(str).str.split("-").str[2].str.upper()
-
-    if "City" not in data.columns:
-        data["City"] = np.nan
-    if "District" not in data.columns:
-        data["District"] = np.nan
-
-    data["City"] = data["City"].fillna(data["p1"].map(city_prefix_map))
-    data["District"] = data["District"].fillna(data["p3"].map(dist_prefix_map))
-
-    data["City"] = data["City"].fillna(
-        data["p1"].replace({
-            "JED": "Jeddah",
-            "TAI": "Taif",
-            "TAB": "Tabuk",
-            "BAH": "Al Baha",
-            "SAM": "Jizan",
-            "SHA": "Jizan",
-            "SHU": "Jizan",
-            "EDA": "Jizan",
-            "DAI": "Jizan",
-            "MOY": "Taif",
-            "TUR": "Taif",
-        })
-    )
-    data["District"] = data["District"].fillna(data["p3"].str.title())
-
-    # Region logic: use district mapping region if available, else normalize to four macro-regions
-    data["Region_raw_main"] = safe_series(data, "Region")
-    data["Region"] = safe_series(data, "Region_sheet")
-    data["Region"] = data["Region"].fillna(
-        pd.Series(
-            [normalize_region(r, c) for r, c in zip(data["Region_raw_main"], data["City"])],
-            index=data.index
-        )
-    )
-
-    date_candidates = ["Created", "Assigned at", "In Progress at", "Updated", "Closed at", "Targeted Completion", "Updated Target Date"]
-    for col in date_candidates:
-        if col in data.columns:
-            data[col] = pd.to_datetime(data[col], errors="coerce")
-
-    num_cols = [
-        "Percentage of Completion","WO Cost","Cost","Updates","Trench Progress","Trench Scope",
-        "MH/HH Progress","MH/HH Scope","Fiber Progress","Fiber Scope","ODBs Progress","ODBs Scope",
-        "ODFs Progress","ODFs Scope","JCL Progress","JCL Scope","FAT Progress","FAT Scope",
-        "PFAT Progress","PFAT Scope","SFAT Progress","SFAT Scope","Permits Progress","Permits Scope",
-        "PIP rejection count","PAT rejection count","Approval rejection count",
-        "As-Built Rejection Count","Handover Rejection Count"
-    ]
-    for col in num_cols:
-        if col in data.columns:
-            data[col] = pd.to_numeric(data[col], errors="coerce")
-
-    snapshot_date = safe_series(data, "Updated").dropna().max()
-    if pd.isna(snapshot_date):
-        snapshot_date = pd.Timestamp.today().normalize()
-
-    targeted = safe_series(data, "Targeted Completion")
-    updated_target = safe_series(data, "Updated Target Date")
-    data["effective_target"] = updated_target.combine_first(targeted)
-
-    start_date = safe_series(data, "In Progress at").combine_first(safe_series(data, "Assigned at")).combine_first(safe_series(data, "Created"))
-    data["start_date"] = pd.to_datetime(start_date, errors="coerce")
-
-    elapsed = (snapshot_date - data["start_date"]).dt.days
-    total = (data["effective_target"] - data["start_date"]).dt.days
-    with np.errstate(divide="ignore", invalid="ignore"):
-        data["planned_progress_pct"] = np.where(total > 0, np.clip((elapsed / total) * 100, 0, 100), np.nan)
-
-    data["actual_progress_pct"] = pd.to_numeric(safe_series(data, "Percentage of Completion"), errors="coerce")
-    data["actual_progress_capped"] = data["actual_progress_pct"].clip(lower=0, upper=100)
-    data["lag_pp"] = data["planned_progress_pct"] - data["actual_progress_capped"]
-    data["is_complete"] = data["actual_progress_capped"] >= 100
-    data["is_overdue"] = (snapshot_date > data["effective_target"]) & (~data["is_complete"]) & data["effective_target"].notna()
-    data["critical_lag"] = data["lag_pp"] >= 15
-
-    updated_series = pd.to_datetime(safe_series(data, "Updated"), errors="coerce")
-    data["days_since_update"] = (snapshot_date - updated_series).dt.days
-    data["Updates"] = pd.to_numeric(safe_series(data, "Updates"), errors="coerce")
-    data["needs_system_update"] = (data["Updates"] < 5) & (data["days_since_update"] > 5)
-
-    elapsed_days = np.maximum((snapshot_date - data["start_date"]).dt.days, 1)
-    actual_ratio = data["actual_progress_capped"] / 100.0
-    est_total_duration = np.where(actual_ratio > 0, elapsed_days / actual_ratio, np.nan)
-    data["forecast_completion_date"] = data["start_date"] + pd.to_timedelta(est_total_duration, unit="D")
-    data["forecast_delay_days"] = (data["forecast_completion_date"] - data["effective_target"]).dt.days
-    data["forecast_risk"] = np.select(
-        [data["forecast_delay_days"] > 30, data["forecast_delay_days"] > 0, data["forecast_delay_days"] <= 0],
-        ["High delay risk", "Moderate delay risk", "On forecast"],
-        default="Insufficient data",
-    )
-
-    data["civil_completion_pct"] = ratio_pct(safe_series(data, "Trench Progress"), safe_series(data, "Trench Scope"))
-    data["mhhh_completion_pct"] = ratio_pct(safe_series(data, "MH/HH Progress"), safe_series(data, "MH/HH Scope"))
-    data["fiber_completion_pct"] = ratio_pct(safe_series(data, "Fiber Progress"), safe_series(data, "Fiber Scope"))
-    data["permits_completion_pct"] = ratio_pct(safe_series(data, "Permits Progress"), safe_series(data, "Permits Scope"))
-
-    # normalize dimensions
-    for col in ["Year", "Work Order Status", "Type", "Class", "Project", "Subclass", "Stage", "Region", "City", "District"]:
-        if col not in data.columns:
-            data[col] = np.nan
-
-    year_series = safe_series(data, "Year")
-    target_year = pd.to_datetime(data["effective_target"], errors="coerce").dt.year.astype("Int64")
-    data["Year"] = pd.to_numeric(year_series, errors="coerce").astype("Int64").fillna(target_year)
-
-    for col in ["Work Order Status", "Type", "Class", "Project", "Subclass", "Stage", "Region", "City", "District"]:
-        data[col] = data[col].fillna("Not Classified").astype(str).str.strip()
-
-    # penalties
-    if penalties.empty:
-        penalties = pd.DataFrame(columns=["Link Code", "Deviation name", "Number of Deviations", "Penalties Amount", "Region", "City", "District"])
-    else:
-        p_link = first_existing(penalties, ["Cluster Name", "Link Code"])
-        p_name = first_existing(penalties, ["Deviation name", "Penalty"])
-        p_qty = first_existing(penalties, ["Number of Deviations", "Number", "Qty"])
-        p_amt = first_existing(penalties, ["Penalties Amount", "Amount"])
-        p_region = first_existing(penalties, ["Region"])
-        p_city = first_existing(penalties, ["City"])
-        p_dist = first_existing(penalties, ["District"])
-
-        penalties["Link Code"] = penalties[p_link].astype(str).str.strip() if p_link else np.nan
-        penalties["Number of Deviations"] = pd.to_numeric(penalties[p_qty], errors="coerce").fillna(0) if p_qty else 0
-        penalties["Penalties Amount"] = pd.to_numeric(penalties[p_amt], errors="coerce").fillna(0) if p_amt else 0
-        penalties["Deviation name"] = penalties[p_name] if p_name else "Deviation"
-
-        if p_region and p_region != "Region":
-            penalties.rename(columns={p_region: "Region"}, inplace=True)
-        if p_city and p_city != "City":
-            penalties.rename(columns={p_city: "City"}, inplace=True)
-        if p_dist and p_dist != "District":
-            penalties.rename(columns={p_dist: "District"}, inplace=True)
-
-        pen_map = data[["Link Code", "Region", "City", "District"]].drop_duplicates("Link Code")
-        penalties = penalties.merge(pen_map, on="Link Code", how="left", suffixes=("", "_main"))
-
-        coalesce_into(penalties, "Region", "Region_main")
-        coalesce_into(penalties, "City", "City_main")
-        coalesce_into(penalties, "District", "District_main")
-
-        penalties["Region"] = penalties["Region"].fillna(penalties["Region_main"] if "Region_main" in penalties.columns else np.nan)
-        penalties["City"] = penalties["City"].fillna("Not Classified")
-        penalties["District"] = penalties["District"].fillna("Not Classified")
-        penalties["Region"] = pd.Series(
-            [normalize_region(r, c) for r, c in zip(penalties["Region"], penalties["City"])],
-            index=penalties.index
-        ).fillna("Not Classified")
-
-    pen_agg = penalties.groupby("Link Code", dropna=False).agg(
-        penalty_rows=("Deviation name", "size"),
-        penalty_qty=("Number of Deviations", "sum"),
-        penalty_amount=("Penalties Amount", "sum"),
-    ).reset_index()
-
-    data = data.merge(pen_agg, on="Link Code", how="left")
-    for c in ["penalty_rows", "penalty_qty", "penalty_amount"]:
-        data[c] = pd.to_numeric(data[c], errors="coerce").fillna(0)
-
-    if details.empty:
-        details = data.copy()
-    else:
-        d_link = first_existing(details, ["Link Code"])
-        if d_link and d_link != "Link Code":
-            details.rename(columns={d_link: "Link Code"}, inplace=True)
-        details["Link Code"] = details["Link Code"].astype(str).str.strip()
-        enrich_cols = [c for c in [
-            "Work Order", "Updates", "Updated", "effective_target", "City", "District", "Region",
-            "Project", "Subclass", "Stage", "Type", "Class", "Work Order Status",
-            "lag_pp", "planned_progress_pct", "actual_progress_capped", "forecast_risk",
-            "penalty_qty", "penalty_amount", "days_since_update"
-        ] if c in data.columns]
-        details = details.merge(
-            data[["Link Code"] + [c for c in enrich_cols if c != "Link Code"]].drop_duplicates("Link Code"),
-            on="Link Code",
-            how="left"
-        )
-        for col in details.columns:
-            if details[col].dtype == "object":
-                details[col] = details[col].map(clean_text)
-        for col in ["Created", "Assigned at", "Updated", "Targeted Completion", "Updated Target Date", "Closed at", "effective_target"]:
-            if col in details.columns:
-                details[col] = pd.to_datetime(details[col], errors="coerce")
-
+    # Use district sheet for city / district. Use mapped region from main raw region.
     warnings = []
-    for c in ["Link Code", "Work Order", "Percentage of Completion", "Updated", "Updates", "Targeted Completion", "Cost", "Work Order Status"]:
-        if c not in data.columns:
-            warnings.append(c)
+    if not district.empty:
+        d_link = first_col(district, ["Link Code"])
+        d_city = first_col(district, ["City"])
+        d_district = first_col(district, ["District"])
+        if d_link is None:
+            warnings.append("District sheet is missing Link Code.")
+        else:
+            mapping = district.rename(columns={
+                d_link: "Link Code",
+                d_city: "City" if d_city else "City",
+                d_district: "District" if d_district else "District"
+            })
+            keep_cols = ["Link Code"] + [c for c in ["City", "District"] if c in mapping.columns]
+            mapping = mapping[keep_cols].drop_duplicates()
+            raw_region_map = main.groupby("Link Code", dropna=False)["Region"].first().map(map_region).reset_index(name="Macro Region")
+            mapping = mapping.merge(raw_region_map, on="Link Code", how="left")
+            main = main.drop(columns=[c for c in ["Macro Region", "City", "District"] if c in main.columns], errors="ignore").merge(mapping, on="Link Code", how="left")
+            details = details.drop(columns=[c for c in ["Macro Region", "City", "District"] if c in details.columns], errors="ignore").merge(mapping, on="Link Code", how="left")
+    else:
+        main["Macro Region"] = main["Region"].map(map_region)
+        details["Macro Region"] = details["Region"].map(map_region)
+        warnings.append("District sheet not found; City and District may be incomplete.")
 
-    return data, penalties, details, snapshot_date, warnings
+    for df in (main, details):
+        df["Effective Target Date"] = effective_date(df)
+        for dcol in ["Created", "Assigned at", "In Progress at", "Targeted Completion", "Updated Target Date", "Updated", "Closed at", "Effective Target Date"]:
+            if dcol in df.columns:
+                df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
+        for c in ["Percentage of Completion","WO Cost","Cost","Trench Progress","Trench Scope","Fiber Progress","Fiber Scope","Updates",
+                  "PIP rejection count","PAT rejection count","Approval rejection count","As-Built Rejection Count","Handover Rejection Count"]:
+            if c in df.columns:
+                df[c] = to_num(df[c])
+        df["Civil Completion %"] = pct_ratio(series_or_default(df, "Trench Progress"), series_or_default(df, "Trench Scope"))
+        df["Fiber Completion %"] = pct_ratio(series_or_default(df, "Fiber Progress"), series_or_default(df, "Fiber Scope"))
+        df["Lag %"] = np.where(df["Percentage of Completion"].fillna(0) < 100,
+                               (100 - df["Percentage of Completion"].fillna(0)).clip(lower=0),
+                               0)
+        today = pd.Timestamp.today().normalize()
+        df["Overdue"] = (df["Effective Target Date"].notna()) & (df["Effective Target Date"] < today) & (df["Percentage of Completion"].fillna(0) < 100)
+        df["Forecast Risk"] = df.apply(risk_bucket, axis=1)
+        updated_dates = pd.to_datetime(series_or_default(df, "Updated"), errors="coerce")
+        update_counts = to_num(series_or_default(df, "Updates")).fillna(0)
+        df["Update Follow-up"] = (update_counts < 5) & ((today - updated_dates).dt.days > 5) & (df["Percentage of Completion"].fillna(0) < 100)
 
+    # penalties prep
+    if not penalties.empty:
+        penalties = penalties.rename(columns={first_col(penalties, ["Cluster Name", "Link Code", "Cluster"]): "Link Code"})
+        dev_col = first_col(penalties, ["Deviation name", "Impl # of Penalty", "Penalty", "Deviation"])
+        num_col = first_col(penalties, ["Number of Deviations", "Number"])
+        amt_col = first_col(penalties, ["Penalties Amount", "Penalty Amount"])
+        if dev_col and dev_col != "Deviation name":
+            penalties = penalties.rename(columns={dev_col: "Deviation name"})
+        if num_col and num_col != "Number of Deviations":
+            penalties = penalties.rename(columns={num_col: "Number of Deviations"})
+        if amt_col and amt_col != "Penalties Amount":
+            penalties = penalties.rename(columns={amt_col: "Penalties Amount"})
+        for c in ["Number of Deviations", "Penalties Amount"]:
+            if c in penalties.columns:
+                penalties[c] = to_num(penalties[c]).fillna(0)
+            else:
+                penalties[c] = 0
+        if "Link Code" in penalties.columns:
+            link_mapping = main[["Link Code", "Macro Region", "City", "District"]].drop_duplicates()
+            penalties = penalties.merge(link_mapping, on="Link Code", how="left", suffixes=("","_map"))
+            if "City_map" in penalties.columns:
+                penalties["City"] = penalties["City"].combine_first(penalties["City_map"]) if "City" in penalties.columns else penalties["City_map"]
+            if "District_map" in penalties.columns:
+                penalties["District"] = penalties["District"].combine_first(penalties["District_map"]) if "District" in penalties.columns else penalties["District_map"]
+            if "Macro Region_map" in penalties.columns:
+                penalties["Macro Region"] = penalties["Macro Region"].combine_first(penalties["Macro Region_map"]) if "Macro Region" in penalties.columns else penalties["Macro Region_map"]
+        penalties["Deviation name"] = series_or_default(penalties, "Deviation name", "").fillna("")
+    else:
+        penalties = pd.DataFrame(columns=["Link Code","Deviation name","Number of Deviations","Penalties Amount","Macro Region","City","District"])
 
-# ---------------------- app start ----------------------
-st.sidebar.title("Control Panel")
-theme_mode = st.sidebar.radio("Theme", ["Dark", "Light"], horizontal=True, index=0)
-apply_theme_css(theme_mode)
+    if not penalties.empty and "Link Code" in penalties.columns:
+        p_group = penalties.groupby("Link Code", dropna=False).agg(
+            **{
+                "Number of Deviations": ("Number of Deviations", "sum"),
+                "Penalty Amount": ("Penalties Amount", "sum"),
+                "Main Deviation": ("Deviation name", lambda s: " | ".join(pd.Series(s).dropna().astype(str).drop_duplicates().head(3).tolist()))
+            }
+        ).reset_index()
+    else:
+        p_group = pd.DataFrame(columns=["Link Code","Number of Deviations","Penalty Amount","Main Deviation"])
 
-uploaded_file = st.sidebar.file_uploader("Upload refreshed Dawiyat workbook", type=["xlsx"])
-source = uploaded_file if uploaded_file is not None else None
+    details = details.merge(p_group, on="Link Code", how="left")
+    details["Number of Deviations"] = to_num(series_or_default(details, "Number of Deviations")).fillna(0).astype(int)
+    details["Penalty Amount"] = to_num(series_or_default(details, "Penalty Amount")).fillna(0)
 
+    snapshot_date = pd.to_datetime(series_or_default(main, "Updated"), errors="coerce").max()
+    return main, penalties, details, snapshot_date, warnings
+
+st.sidebar.markdown("## Control Panel")
+theme_mode = st.sidebar.radio("Theme", ["Dark", "Light"], horizontal=True)
+style(theme_mode)
+
+uploaded = st.sidebar.file_uploader("Upload refreshed Dawiyat workbook", type=["xlsx"])
+source = uploaded if uploaded is not None else Path(__file__).with_name(DEFAULT_FILE)
 data, penalties, details, snapshot_date, data_warnings = load_data(source)
 
-st.markdown(
-    f"""
-    <div class="top-banner">
-        <h1 style="margin:0 0 6px 0;">Dawiyat Project Intelligence Dashboard</h1>
-        <div class="subtle">
-            Executive PMO dashboard for top management decision support.
-            Snapshot date: <b>{pd.to_datetime(snapshot_date).strftime('%d %b %Y %H:%M')}</b>
-        </div>
-        <div style="margin-top:10px;">
-            <span class="small-chip">Professional first-style executive layout</span>
-            <span class="small-chip">Daily refresh from latest workbook</span>
-            <span class="small-chip">Region filter normalized to Western / Southern / Eastern / Northern</span>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+def options_from(series):
+    vals = pd.Series(series).dropna().astype(str).str.strip()
+    vals = vals[vals != ""]
+    return sorted(vals.unique().tolist())
+
+filtered = data.copy()
+region_opts = ["All"] + options_from(filtered.get("Macro Region", pd.Series(dtype=str)))
+region_sel = st.sidebar.selectbox("Region", region_opts)
+if region_sel != "All":
+    filtered = filtered[filtered["Macro Region"].astype(str) == region_sel]
+
+city_opts = ["All"] + options_from(filtered.get("City", pd.Series(dtype=str)))
+city_sel = st.sidebar.selectbox("City", city_opts)
+if city_sel != "All":
+    filtered = filtered[filtered["City"].astype(str) == city_sel]
+
+district_opts = ["All"] + options_from(filtered.get("District", pd.Series(dtype=str)))
+district_sel = st.sidebar.selectbox("District", district_opts)
+if district_sel != "All":
+    filtered = filtered[filtered["District"].astype(str) == district_sel]
+
+project_opts = ["All"] + options_from(filtered.get("Project", pd.Series(dtype=str)))
+project_sel = st.sidebar.selectbox("Project", project_opts)
+if project_sel != "All":
+    filtered = filtered[filtered["Project"].astype(str) == project_sel]
+
+subclass_opts = ["All"] + options_from(filtered.get("Subclass", pd.Series(dtype=str)))
+subclass_sel = st.sidebar.selectbox("Subclass", subclass_opts)
+if subclass_sel != "All":
+    filtered = filtered[filtered["Subclass"].astype(str) == subclass_sel]
+
+status_opts = ["All"] + options_from(filtered.get("Work Order Status", pd.Series(dtype=str)))
+status_sel = st.sidebar.selectbox("Work Order Status", status_opts)
+if status_sel != "All":
+    filtered = filtered[filtered["Work Order Status"].astype(str) == status_sel]
+
+link_opts = ["All"] + options_from(filtered.get("Link Code", pd.Series(dtype=str)))
+link_sel = st.sidebar.selectbox("Link Code", link_opts)
+if link_sel != "All":
+    filtered = filtered[filtered["Link Code"].astype(str) == link_sel]
+
+filtered_details = details[details["Link Code"].isin(filtered["Link Code"].unique())].copy()
+filtered_pen = penalties[penalties["Link Code"].isin(filtered["Link Code"].unique())].copy() if not penalties.empty else penalties.copy()
+
+st.markdown(f"""
+<div class="hero">
+  <div style="font-size:1.0rem;color:#9CB0CD;">DAWIYAT PROJECT</div>
+  <div style="font-size:2.0rem;font-weight:800;">Executive Project Intelligence Dashboard</div>
+  <div class="small-note">Snapshot date: {snapshot_date.strftime("%d-%b-%Y %H:%M") if pd.notna(snapshot_date) else "Not available"} | Filters apply across overview, PMO, KPI, penalties, and work order detail pages.</div>
+</div>
+""", unsafe_allow_html=True)
 
 if data_warnings:
-    st.warning("Missing key columns detected in workbook: " + ", ".join(data_warnings))
+    with st.expander("Data mapping warnings"):
+        for w in data_warnings:
+            st.warning(w)
 
+tab_overview, tab_pmo, tab_kpi, tab_pen, tab_detail, tab_guide = st.tabs(
+    ["Executive Overview", "PMO Summary", "Schedule & KPI", "Penalties & Quality", "Work Order Detail", "Dashboard Guide"]
+)
 
-def options_for(df, col):
-    if col not in df.columns:
-        return ["All"]
-    vals = [v for v in pd.Series(df[col]).dropna().astype(str).unique().tolist() if v not in {"nan", "None"}]
-    return ["All"] + sorted(vals)
+today = pd.Timestamp.today().normalize()
+total_links = filtered["Link Code"].nunique()
+avg_progress = filtered.groupby("Link Code")["Percentage of Completion"].mean().mean() if not filtered.empty else 0
+avg_civil = filtered["Civil Completion %"].mean()
+avg_fiber = filtered["Fiber Completion %"].mean()
+overdue_df = filtered[filtered["Overdue"]].copy()
+critical_df = filtered[filtered["Lag %"] >= 15].copy()
+cancelled_count = int((filtered["Work Order Status"].astype(str).str.upper() == "CANCELLED").sum()) if "Work Order Status" in filtered.columns else 0
+in_progress_count = int((filtered["Work Order Status"].astype(str).str.upper() == "IN PROGRESS").sum()) if "Work Order Status" in filtered.columns else 0
 
+with tab_overview:
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: add_card("Total Link Codes", f"{int(total_links)}", "Distinct link codes after filters")
+    with c2: add_card("Avg Overall Progress", fmt_pct(avg_progress), "Mean % completion")
+    with c3: add_card("Avg Civil Completion", fmt_pct(avg_civil), "Trench progress / scope")
+    with c4: add_card("Avg Fiber Completion", fmt_pct(avg_fiber), "Fiber progress / scope")
+    with c5: add_card("Overdue Work Orders", f"{len(overdue_df)}", "Past effective target and not complete")
 
-base = data.copy()
-region = st.sidebar.selectbox("Region", options_for(base, "Region"), index=0)
-if region != "All":
-    base = base[base["Region"].astype(str) == region]
-city = st.sidebar.selectbox("City", options_for(base, "City"), index=0)
-if city != "All":
-    base = base[base["City"].astype(str) == city]
-district = st.sidebar.selectbox("District", options_for(base, "District"), index=0)
-if district != "All":
-    base = base[base["District"].astype(str) == district]
-project = st.sidebar.selectbox("Project", options_for(base, "Project"), index=0)
-if project != "All":
-    base = base[base["Project"].astype(str) == project]
-stage = st.sidebar.selectbox("Stage", options_for(base, "Stage"), index=0)
-if stage != "All":
-    base = base[base["Stage"].astype(str) == stage]
-year = st.sidebar.selectbox("Year", options_for(base.assign(Year=base["Year"].astype(str)), "Year"), index=0)
-if year != "All":
-    base = base[base["Year"].astype(str) == year]
-status = st.sidebar.selectbox("Work Order Status", options_for(base, "Work Order Status"), index=0)
-if status != "All":
-    base = base[base["Work Order Status"].astype(str) == status]
-wo_type = st.sidebar.selectbox("Type", options_for(base, "Type"), index=0)
-if wo_type != "All":
-    base = base[base["Type"].astype(str) == wo_type]
-wo_class = st.sidebar.selectbox("Class", options_for(base, "Class"), index=0)
-if wo_class != "All":
-    base = base[base["Class"].astype(str) == wo_class]
-subclass = st.sidebar.selectbox("Subclass", options_for(base, "Subclass"), index=0)
-if subclass != "All":
-    base = base[base["Subclass"].astype(str) == subclass]
-link_code = st.sidebar.selectbox("Link Code", options_for(base, "Link Code"), index=0)
+    left, right = st.columns([1.3, 1])
+    with left:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        city_perf = filtered.groupby(["City"], dropna=False)["Percentage of Completion"].mean().reset_index()
+        city_perf["City"] = city_perf["City"].fillna("Unmapped")
+        fig = px.bar(city_perf.sort_values("Percentage of Completion", ascending=False),
+                     x="City", y="Percentage of Completion",
+                     text_auto=".1f", title="City Average Progress")
+        fig.update_layout(height=360, xaxis_title="", yaxis_title="Progress %")
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-filtered = base.copy()
-if link_code != "All":
-    filtered = filtered[filtered["Link Code"].astype(str) == link_code]
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        stage_perf = filtered.groupby("Stage", dropna=False)["Link Code"].nunique().reset_index(name="Link Codes")
+        if not stage_perf.empty:
+            fig2 = px.bar(stage_perf.sort_values("Link Codes", ascending=False), x="Link Codes", y="Stage", orientation="h",
+                          title="Stage Distribution by Link Code")
+            fig2.update_layout(height=360, yaxis_title="", xaxis_title="Link Codes")
+            st.plotly_chart(fig2, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-if filtered.empty:
-    st.warning("No records match the selected filters.")
-    st.stop()
+    with right:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        district_lag = filtered.groupby("District", dropna=False)["Lag %"].mean().reset_index().sort_values("Lag %", ascending=False).head(12)
+        district_lag["District"] = district_lag["District"].fillna("Unmapped")
+        fig3 = px.bar(district_lag, x="Lag %", y="District", orientation="h", title="District Lag Ranking", text_auto=".1f")
+        fig3.update_layout(height=360, yaxis_title="", xaxis_title="Lag %")
+        st.plotly_chart(fig3, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-filtered_links = filtered["Link Code"].dropna().astype(str).unique().tolist()
-filtered_details = details[details["Link Code"].astype(str).isin(filtered_links)].copy() if "Link Code" in details.columns else pd.DataFrame()
-filtered_penalties = penalties[penalties["Link Code"].astype(str).isin(filtered_links)].copy() if "Link Code" in penalties.columns else pd.DataFrame()
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        status_counts = filtered.groupby("Work Order Status", dropna=False)["Link Code"].count().reset_index(name="Count")
+        status_counts["Work Order Status"] = status_counts["Work Order Status"].fillna("Unknown")
+        fig4 = px.pie(status_counts, names="Work Order Status", values="Count", hole=0.55, title="Work Order Status Mix")
+        fig4.update_layout(height=360)
+        st.plotly_chart(fig4, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-# KPI calculations
-total_wo = filtered["Work Order"].nunique() if "Work Order" in filtered.columns else len(filtered)
-total_link = filtered["Link Code"].nunique()
-avg_actual = filtered["actual_progress_capped"].mean()
-avg_planned = filtered["planned_progress_pct"].mean()
-avg_lag_pp = filtered["lag_pp"].mean()
-lagged_pct = (filtered["lag_pp"] > 0).mean() * 100 if len(filtered) else np.nan
-overdue_cnt = int(filtered["is_overdue"].sum())
-critical_lag_cnt = int(filtered["critical_lag"].sum())
-forecast_high_risk = int((filtered["forecast_risk"] == "High delay risk").sum())
-penalty_rows = int(len(filtered_penalties))
-penalty_qty = float(pd.to_numeric(filtered_penalties["Number of Deviations"], errors="coerce").fillna(0).sum()) if not filtered_penalties.empty else 0.0
-penalty_amount = float(pd.to_numeric(filtered_penalties["Penalties Amount"], errors="coerce").fillna(0).sum()) if not filtered_penalties.empty else 0.0
-avg_civil = filtered["civil_completion_pct"].mean()
-avg_fiber = filtered["fiber_completion_pct"].mean()
-rejection_cols = [c for c in ["PIP rejection count","PAT rejection count","Approval rejection count","As-Built Rejection Count","Handover Rejection Count"] if c in filtered.columns]
-rejections_total = float(filtered[rejection_cols].fillna(0).sum().sum()) if rejection_cols else 0
-update_needed = filtered[filtered["needs_system_update"]].copy()
-in_progress_cnt = int(filtered["Work Order Status"].astype(str).str.contains("In Progress", case=False, na=False).sum())
-cancelled_cnt = int(filtered["Work Order Status"].astype(str).str.contains("Cancel", case=False, na=False).sum())
-
-cost_col = "Cost" if "Cost" in filtered.columns else ("WO Cost" if "WO Cost" in filtered.columns else None)
-snapshot_month = pd.Timestamp(snapshot_date).to_period("M")
-target_month_series = pd.to_datetime(safe_series(filtered, "Targeted Completion"), errors="coerce").dt.to_period("M")
-updated_month_series = pd.to_datetime(safe_series(filtered, "Updated Target Date"), errors="coerce").dt.to_period("M")
-if cost_col:
-    current_month_target_cost = pd.to_numeric(filtered.loc[target_month_series == snapshot_month, cost_col], errors="coerce").fillna(0).sum()
-    current_month_updated_target_cost = pd.to_numeric(filtered.loc[updated_month_series == snapshot_month, cost_col], errors="coerce").fillna(0).sum()
-else:
-    current_month_target_cost = 0
-    current_month_updated_target_cost = 0
-
-
-def chart_layout(fig, title=None, height=360):
-    fig.update_layout(
-        margin=dict(l=20, r=20, t=48, b=20),
-        legend_title_text="",
-        height=height,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        title=title,
-    )
-    return fig
-
-
-def monthly_progress_chart(df):
-    temp = df.copy()
-    temp["target_month"] = pd.to_datetime(temp["effective_target"], errors="coerce").dt.to_period("M").astype(str)
-    grp = temp.groupby("target_month", dropna=False).agg(
-        Planned=("planned_progress_pct", "mean"),
-        Actual=("actual_progress_capped", "mean"),
+with tab_pmo:
+    flagged = filtered.groupby("Link Code", dropna=False).agg(
+        Region=("Macro Region", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else np.nan),
+        City=("City", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else np.nan),
+        District=("District", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else np.nan),
+        Avg_Progress=("Percentage of Completion", "mean"),
+        Latest_Update=("Updated", "max"),
+        Max_Updates=("Updates", "max"),
+        Work_Orders=("Work Order", "nunique"),
+        Effective_Target=("Effective Target Date", "max"),
+        Total_Cost=("Cost", "sum")
     ).reset_index()
-    grp = grp[grp["target_month"] != "NaT"].sort_values("target_month")
-    if grp.empty:
-        return None
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=grp["target_month"], y=grp["Planned"], mode="lines+markers", name="Planned"))
-    fig.add_trace(go.Scatter(x=grp["target_month"], y=grp["Actual"], mode="lines+markers", name="Actual"))
-    fig.update_yaxes(range=[0, 110], title="Progress %")
-    fig.update_xaxes(title="Target Month")
-    return chart_layout(fig, "Planned vs Actual Progress Trend")
+    flagged["Needs System Update"] = (flagged["Max_Updates"].fillna(0) < 5) & ((today - flagged["Latest_Update"]).dt.days > 5) & (flagged["Avg_Progress"].fillna(0) < 100)
+    followup = flagged[flagged["Needs System Update"]].sort_values(["Latest_Update", "Avg_Progress"])
 
+    best_link = flagged[(flagged["Avg_Progress"] >= 100) & ((flagged["Effective_Target"].isna()) | (flagged["Effective_Target"] >= today))]
+    best_link = best_link.sort_values(["Avg_Progress", "Latest_Update"], ascending=[False, False]).head(15)
 
-def city_status_chart(df):
-    grp = df.groupby(["City"], dropna=False).agg(
-        Avg_Planned=("planned_progress_pct", "mean"),
-        Avg_Actual=("actual_progress_capped", "mean"),
-        Lag=("lag_pp", "mean"),
-    ).reset_index().sort_values("Avg_Actual", ascending=False)
-    if grp.empty:
-        return None
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=grp["City"], y=grp["Avg_Planned"], name="Planned"))
-    fig.add_trace(go.Bar(x=grp["City"], y=grp["Avg_Actual"], name="Actual"))
-    fig.update_layout(barmode="group")
-    fig.update_yaxes(title="Progress %")
-    return chart_layout(fig, "City Performance")
+    cost_base = filtered.copy()
+    cost_base["Original Target Month"] = pd.to_datetime(cost_base["Targeted Completion"], errors="coerce").dt.to_period("M").astype("string")
+    cost_base["Effective Target Month"] = pd.to_datetime(cost_base["Effective Target Date"], errors="coerce").dt.to_period("M").astype("string")
+    monthly_original = cost_base.groupby("Original Target Month", dropna=False)["Cost"].sum().reset_index(name="Original Target Cost")
+    monthly_effective = cost_base.groupby("Effective Target Month", dropna=False)["Cost"].sum().reset_index(name="Updated / Final Target Cost")
+    monthly = monthly_original.merge(monthly_effective, left_on="Original Target Month", right_on="Effective Target Month", how="outer")
+    monthly["Month"] = monthly["Original Target Month"].combine_first(monthly["Effective Target Month"])
+    monthly = monthly[monthly["Month"].notna()].sort_values("Month")
 
+    a,b,c,d = st.columns(4)
+    with a: add_card("Link Codes Need Update", f"{int(len(followup))}", "Updates < 5 and last update > 5 days")
+    with b: add_card("Cancelled Work Orders", f"{cancelled_count}", "From Work Order Status")
+    with c: add_card("In Progress Work Orders", f"{in_progress_count}", "From Work Order Status")
+    with d: add_card("Best Completed Link Codes", f"{int(len(best_link))}", "Completed with no delay exposure")
 
-def milestone_chart(df):
-    rows = []
-    for label, col in [("Civil", "civil_completion_pct"), ("MH/HH", "mhhh_completion_pct"), ("Fiber", "fiber_completion_pct"), ("Permits", "permits_completion_pct")]:
-        if col in df.columns:
-            rows.append({"Milestone": label, "Completion": df[col].mean()})
-    grp = pd.DataFrame(rows)
-    if grp.empty:
-        return None
-    fig = px.bar(grp, x="Milestone", y="Completion")
-    fig.update_yaxes(range=[0, 110], title="Completion %")
-    return chart_layout(fig, "Milestone Completion Summary")
+    left, right = st.columns([1.2, 1])
+    with left:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.subheader("PMO Follow-up Link Codes")
+        st.caption("Top-management action list. Criteria: Updates < 5, last system update older than 5 days, and average progress below 100%.")
+        view = followup[["Link Code","Region","City","District","Avg_Progress","Max_Updates","Latest_Update","Work_Orders"]].copy()
+        view = view.rename(columns={"Avg_Progress":"Avg Progress %","Max_Updates":"Updates","Latest_Update":"Last Updated","Work_Orders":"Work Orders"})
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.download_button("Export PMO follow-up (Excel)", data=to_excel_bytes(view, "PMO FollowUp"), file_name="pmo_followup_linkcodes.xlsx")
+        st.markdown("</div>", unsafe_allow_html=True)
 
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.subheader("Monthly Target Cost Analysis")
+        st.caption("Original target month uses Targeted Completion. Final target month uses Updated Target Date when available; otherwise it keeps the original target date.")
+        if not monthly.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=monthly["Month"], y=monthly["Original Target Cost"], name="Original Target Cost"))
+            fig.add_trace(go.Scatter(x=monthly["Month"], y=monthly["Updated / Final Target Cost"], name="Final Target Cost", mode="lines+markers"))
+            fig.update_layout(height=360, xaxis_title="Month", yaxis_title="Cost (SAR)")
+            st.plotly_chart(fig, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-def risk_chart(df):
-    grp = df["forecast_risk"].value_counts().rename_axis("Risk").reset_index(name="Count")
-    if grp.empty:
-        return None
-    fig = px.bar(grp, x="Risk", y="Count")
-    return chart_layout(fig, "Forecast Risk Exposure")
+    with right:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.subheader("Best Link Codes Delivered On / Before Plan")
+        st.caption("Completed link codes with no delay exposure based on effective target date.")
+        show = best_link[["Link Code","Region","City","District","Avg_Progress","Latest_Update"]].copy()
+        show = show.rename(columns={"Avg_Progress":"Avg Progress %","Latest_Update":"Last Updated"})
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        city_link = flagged.groupby(["Region","City"], dropna=False).size().reset_index(name="Link Codes")
+        city_link["City"] = city_link["City"].fillna("Unmapped")
+        fig = px.bar(city_link, x="City", y="Link Codes", color="Region", title="Link Code Distribution by Region / City", barmode="group")
+        fig.update_layout(height=360, xaxis_title="", yaxis_title="Link Codes")
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-def penalties_deviation_chart(df):
-    if df.empty:
-        return None
-    grp = df.groupby("Deviation name", dropna=False).agg(
-        Deviations=("Number of Deviations", "sum"),
-        Deduction=("Penalties Amount", "sum"),
-    ).reset_index().sort_values("Deviations", ascending=False).head(12)
-    if grp.empty:
-        return None
-    fig = go.Figure()
-    fig.add_trace(go.Bar(y=grp["Deviation name"], x=grp["Deviations"], name="Deviation Count", orientation="h"))
-    fig.add_trace(go.Scatter(y=grp["Deviation name"], x=grp["Deduction"], name="Penalty Amount", mode="markers"))
-    fig.update_layout(yaxis=dict(categoryorder="total ascending"))
-    return chart_layout(fig, "Top Deviations vs Deduction Amount", height=420)
+with tab_kpi:
+    rej_cols = [c for c in ["PIP rejection count","PAT rejection count","Approval rejection count","As-Built Rejection Count","Handover Rejection Count"] if c in filtered.columns]
+    total_rejections = int(filtered[rej_cols].fillna(0).sum().sum()) if rej_cols else 0
 
+    a,b,c,d,e = st.columns(5)
+    with a: add_card("Avg Civil Completion", fmt_pct(avg_civil), "Trench progress / scope")
+    with b: add_card("Avg Fiber Completion", fmt_pct(avg_fiber), "Fiber progress / scope")
+    with c: add_card("Overdue Work Orders", f"{len(overdue_df)}", "Past effective target and not complete")
+    with d: add_card("Critical Lag", f"{len(critical_df)}", "Lag >= 15%")
+    with e: add_card("Total Rejections", f"{total_rejections}", "Sum of PIP, PAT, Approval, As-Built, and Handover rejections")
 
-def district_lag_chart(df):
-    grp = df.groupby("District", dropna=False).agg(Lag=("lag_pp", "mean")).reset_index().sort_values("Lag", ascending=False).head(12)
-    if grp.empty:
-        return None
-    fig = px.bar(grp, x="Lag", y="District", orientation="h")
-    fig.update_layout(yaxis=dict(categoryorder="total ascending"))
-    return chart_layout(fig, "District Lag Ranking", height=420)
-
-
-tabs = st.tabs(["Executive Overview", "PMO Summary", "Schedule & KPI", "Penalties & Quality", "Work Order Detail", "Dashboard Guide"])
-
-with tabs[0]:
-    row = st.columns(6)
-    metrics = [
-        ("Work Orders", f"{total_wo:,}", f"{total_link:,} link codes"),
-        ("Avg Actual Progress", fmt_pct(avg_actual), "Overall completion"),
-        ("Avg Planned Progress", fmt_pct(avg_planned), "Based on effective target dates"),
-        ("Avg Lag", fmt_pct(avg_lag_pp), "Planned minus actual"),
-        ("High Delay Risk", f"{forecast_high_risk:,}", "Forecast delay > 30 days"),
-        ("Penalty Amount", fmt_money(penalty_amount), "Total deduction amount"),
-    ]
-    for col, metric in zip(row, metrics):
-        with col:
-            add_card(*metric)
-
-    c1, c2 = st.columns([1.15, 0.85])
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("Overdue Work Orders - Action List")
+    risk_options = sorted(overdue_df["Forecast Risk"].dropna().unique().tolist()) if not overdue_df.empty else []
+    risk_filter = st.multiselect("Filter overdue list by forecast risk", options=risk_options, default=risk_options)
+    overdue_view = overdue_df[overdue_df["Forecast Risk"].isin(risk_filter)] if risk_filter else overdue_df.iloc[0:0]
+    overdue_view = overdue_view[[c for c in ["Link Code","Work Order","Macro Region","City","District","Subclass","Stage","Percentage of Completion","Targeted Completion","Updated Target Date","Effective Target Date","Updated","Updates","Lag %","Forecast Risk"] if c in overdue_view.columns]].copy()
+    overdue_view = overdue_view.rename(columns={"Macro Region":"Region"})
+    st.dataframe(overdue_view.sort_values(["Effective Target Date","Lag %"], ascending=[True, False]), use_container_width=True, hide_index=True)
+    c1,c2 = st.columns(2)
     with c1:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        fig = monthly_progress_chart(filtered)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Not enough target-date data for trend chart.")
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.download_button("Export overdue work orders (Excel)", data=to_excel_bytes(overdue_view, "Overdue Work Orders"), file_name="overdue_workorders.xlsx")
     with c2:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        fig = risk_chart(filtered)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No forecast risk data available.")
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.download_button("Export overdue work orders (CSV)", data=overdue_view.to_csv(index=False).encode("utf-8-sig"), file_name="overdue_workorders.csv")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    c3, c4 = st.columns([1.05, 0.95])
-    with c3:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        fig = city_status_chart(filtered)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-    with c4:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        fig = milestone_chart(filtered)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-with tabs[1]:
-    row = st.columns(6)
-    pmo_metrics = [
-        ("Need System Update", f"{len(update_needed):,}", "Updates < 5 and no update for > 5 days"),
-        ("Current Month Target Cost", fmt_money(current_month_target_cost), "From Targeted Completion"),
-        ("Current Month Updated Target Cost", fmt_money(current_month_updated_target_cost), "From Updated Target Date"),
-        ("Lagged Work Orders", fmt_pct(lagged_pct), "Share of work orders behind plan"),
-        ("In Progress", f"{in_progress_cnt:,}", "From Work Order Status"),
-        ("Cancelled", f"{cancelled_cnt:,}", "From Work Order Status"),
-    ]
-    for col, metric in zip(row, pmo_metrics):
-        with col:
-            add_card(*metric)
-
-    left, right = st.columns([0.95, 1.05])
+    left, right = st.columns([1.1, 1])
     with left:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        fig = district_lag_chart(filtered)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        lag_by_district = filtered.groupby("District", dropna=False)["Lag %"].mean().reset_index().sort_values("Lag %", ascending=False)
+        lag_by_district["District"] = lag_by_district["District"].fillna("Unmapped")
+        fig = px.bar(lag_by_district.head(15), x="Lag %", y="District", orientation="h", title="District Lag Ranking", text_auto=".1f")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     with right:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Link Codes Requiring System Update")
-        if update_needed.empty:
-            st.success("No link codes currently match the PMO update-follow-up rule.")
-        else:
-            cols = [c for c in ["Link Code", "Work Order", "Region", "City", "District", "Stage", "Updated", "Updates", "days_since_update", "actual_progress_capped", "planned_progress_pct", "lag_pp", "effective_target"] if c in update_needed.columns]
-            pmo_table = update_needed[cols].copy().sort_values(["days_since_update", "lag_pp"], ascending=[False, False])
-            st.dataframe(pmo_table, use_container_width=True, hide_index=True)
-            st.download_button("Download PMO follow-up list (Excel)", data=to_excel_bytes(pmo_table, "PMO Follow Up"), file_name="pmo_follow_up_link_codes.xlsx")
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        progress_trend = filtered.copy().dropna(subset=["Effective Target Date"])
+        if not progress_trend.empty:
+            monthly_prog = progress_trend.groupby(progress_trend["Effective Target Date"].dt.to_period("M").astype(str))["Percentage of Completion"].mean().reset_index()
+            monthly_prog.columns = ["Month", "Avg Progress %"]
+            fig = px.line(monthly_prog, x="Month", y="Avg Progress %", markers=True, title="Average Progress by Effective Target Month")
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-with tabs[2]:
-    row = st.columns(5)
-    schedule_metrics = [
-        ("Avg Civil Completion", fmt_pct(avg_civil), "Trench progress / scope"),
-        ("Avg Fiber Completion", fmt_pct(avg_fiber), "Fiber progress / scope"),
-        ("Overdue Work Orders", f"{overdue_cnt:,}", "Past effective target and not complete"),
-        ("Critical Lag", f"{critical_lag_cnt:,}", "Lag >= 15%"),
-        ("Total Rejections", f"{rejections_total:,.0f}", "All rejection counts combined"),
-    ]
-    for col, metric in zip(row, schedule_metrics):
-        with col:
-            add_card(*metric)
+with tab_pen:
+    dev_total = int(filtered_pen["Number of Deviations"].sum()) if not filtered_pen.empty and "Number of Deviations" in filtered_pen.columns else 0
+    pen_total = float(filtered_pen["Penalties Amount"].sum()) if not filtered_pen.empty and "Penalties Amount" in filtered_pen.columns else 0
 
-    left, right = st.columns(2)
+    a,b = st.columns(2)
+    with a: add_card("Number of Deviations", f"{dev_total}", "Sum of deviation counts")
+    with b: add_card("Penalty Deduction Amount", fmt_money(pen_total), "Sum of deducted amount only")
+
+    left, right = st.columns([1.2, 1])
     with left:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        fig = monthly_progress_chart(filtered)
-        if fig:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.subheader("Top Deviations vs Penalty Amount")
+        if not filtered_pen.empty:
+            dev_chart = filtered_pen.groupby("Deviation name", dropna=False).agg(
+                Number_of_Deviations=("Number of Deviations","sum"),
+                Penalty_Amount=("Penalties Amount","sum")
+            ).reset_index().sort_values(["Number_of_Deviations","Penalty_Amount"], ascending=False).head(10)
+            fig = go.Figure()
+            fig.add_trace(go.Bar(y=dev_chart["Deviation name"], x=dev_chart["Number_of_Deviations"], orientation="h", name="Number of Deviations"))
+            fig.add_trace(go.Scatter(y=dev_chart["Deviation name"], x=dev_chart["Penalty_Amount"], mode="markers", marker=dict(size=12), name="Penalty Amount"))
+            fig.update_layout(height=420, yaxis_title="", xaxis_title="Count / SAR")
             st.plotly_chart(fig, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.subheader("Deviation Analysis Table")
+        if not filtered_pen.empty:
+            dev_tbl = filtered_pen.groupby(["Deviation name"], dropna=False).agg(
+                **{"Number of Deviations":("Number of Deviations","sum"),
+                   "Penalty Amount":("Penalties Amount","sum")}
+            ).reset_index().sort_values(["Number of Deviations","Penalty Amount"], ascending=False)
+            st.dataframe(dev_tbl, use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
     with right:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        fig = district_lag_chart(filtered)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-with tabs[3]:
-    row = st.columns(4)
-    pen_metrics = [
-        ("Deviation Rows", f"{penalty_rows:,}", "Rows / records in penalties after filter"),
-        ("Number of Deviations", f"{penalty_qty:,.0f}", "Sum of deviation counts"),
-        ("Penalty Deduction Amount", fmt_money(penalty_amount), "Sum of deducted amount only"),
-        ("Deviation Records With No Deduction", f"{int((filtered_penalties['Penalties Amount'].fillna(0) <= 0).sum()) if not filtered_penalties.empty else 0:,}", "Not all deviations have penalties"),
-    ]
-    for col, metric in zip(row, pen_metrics):
-        with col:
-            add_card(*metric)
-
-    st.markdown(
-        """
-        <div class="guide-box">
-            <div class="guide-title">Penalties interpretation</div>
-            <div class="subtle">
-                Number of deviations and deduction amount are two different measures.
-                The dashboard sums <b>Number of Deviations</b> as total observed deviations,
-                while <b>Penalties Amount</b> sums only the values that will actually be deducted.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    left, right = st.columns([1.15, 0.85])
-    with left:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        fig = penalties_deviation_chart(filtered_penalties)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No penalties records available for the selected filters.")
-        st.markdown('</div>', unsafe_allow_html=True)
-    with right:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        quality_df = filtered[["Link Code", "penalty_qty", "penalty_amount", "lag_pp", "forecast_risk"]].copy()
-        quality_df = quality_df.sort_values(["penalty_amount", "penalty_qty", "lag_pp"], ascending=[False, False, False]).head(15)
-        quality_df.rename(columns={"penalty_qty": "Deviation Count", "penalty_amount": "Deduction Amount", "lag_pp": "Lag %", "forecast_risk": "Forecast Risk"}, inplace=True)
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.subheader("Top Quality / Penalty Exposure")
-        st.dataframe(quality_df, use_container_width=True, hide_index=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        if not filtered_pen.empty:
+            exposure = filtered_pen.groupby("Link Code", dropna=False).agg(
+                **{"Number of Deviations":("Number of Deviations","sum"),
+                   "Deduction Amount":("Penalties Amount","sum")}
+            ).reset_index()
+            lag_link = filtered.groupby("Link Code", dropna=False)["Lag %"].mean().reset_index()
+            exposure = exposure.merge(lag_link, on="Link Code", how="left")
+            exposure = exposure.sort_values(["Deduction Amount","Number of Deviations"], ascending=False)
+            st.dataframe(exposure, use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-with tabs[4]:
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+with tab_detail:
     st.subheader("Work Order Detail")
-    preferred_cols = [
-        "Link Code", "Work Order", "Region", "City", "District", "Project", "Subclass", "Stage",
-        "Type", "Class", "Work Order Status", "Percentage of Completion", "planned_progress_pct",
-        "lag_pp", "Cost", "WO Cost", "Created", "Assigned at", "Updated", "Updates",
-        "Targeted Completion", "Updated Target Date", "effective_target",
-        "Trench Progress", "Trench Scope", "MH/HH Progress", "MH/HH Scope",
-        "Fiber Progress", "Fiber Scope", "Permits Progress", "Permits Scope",
-        "PIP rejection count", "PAT rejection count", "Approval rejection count",
-        "As-Built Rejection Count", "Handover Rejection Count",
-        "Parent", "Number", "Request", "SOR Reference Number", "Target Area",
-        "Notes", "Scope of Work", "penalty_qty", "penalty_amount", "forecast_risk"
-    ]
-    visible_cols = [c for c in preferred_cols if c in filtered_details.columns]
-    work_detail = filtered_details[visible_cols].copy() if visible_cols else filtered_details.copy()
-    st.dataframe(work_detail, use_container_width=True, hide_index=True)
-    b1, b2 = st.columns(2)
-    with b1:
-        st.download_button("Export Work Order Detail (Excel)", data=to_excel_bytes(work_detail, "Workorder Detail"), file_name="workorder_detail_export.xlsx")
-    with b2:
-        st.download_button("Export Work Order Detail (CSV)", data=to_csv_bytes(work_detail), file_name="workorder_detail_export.csv")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with tabs[5]:
-    st.markdown(
-        """
-        <div class="guide-box">
-            <div class="guide-title">Dashboard calculation guide</div>
-            <div class="subtle">
-                <b>Actual Progress</b> comes from Percentage of Completion and is capped at 100% for KPI averaging.<br>
-                <b>Planned Progress</b> is derived from elapsed time between start date and effective target date.<br>
-                <b>Effective Target Date</b> = Updated Target Date when available, otherwise Targeted Completion.<br>
-                <b>Lag %</b> = Planned Progress - Actual Progress.<br>
-                <b>Critical Lag</b> means lag is 15% or higher.<br>
-                <b>Need System Update</b> means Updates &lt; 5 and days since last update &gt; 5 days.<br>
-                <b>Current Month Target Cost</b> is the sum of Cost for work orders whose target date falls in the snapshot month.<br>
-                <b>Penalty Deduction Amount</b> sums only deductible values, while Number of Deviations sums all recorded deviations.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+    detail_cols = [c for c in [
+        "Link Code","Work Order","Macro Region","City","District","Project","Subclass","Stage","Work Order Status","Type","Class",
+        "Percentage of Completion","Civil Completion %","Fiber Completion %","Cost","Created","Assigned at","Targeted Completion","Updated Target Date",
+        "Effective Target Date","Updated","Updates","Target Area","Notes","Scope of Work","Number of Deviations","Penalty Amount","Main Deviation","Forecast Risk"
+    ] if c in filtered_details.columns]
+    show = filtered_details[detail_cols].copy()
+    show = show.rename(columns={"Macro Region":"Region","Penalty Amount":"Penalty Amount"})
+    st.dataframe(show, use_container_width=True, hide_index=True)
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown(
-            """
-            <div class="guide-box">
-                <div class="guide-title">Region logic</div>
-                <div class="subtle">
-                    Region is normalized for dashboard filtering to four macro groups:
-                    Western, Southern, Eastern, and Northern.
-                    District / City mapping is taken from the District sheet first, then from link code fallback.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.download_button("Export work order detail (Excel)", data=to_excel_bytes(show, "WorkOrder Detail"), file_name="workorder_detail.xlsx")
     with c2:
-        missing_city = int((filtered["City"] == "Not Classified").sum())
-        missing_district = int((filtered["District"] == "Not Classified").sum())
-        dq_score = 100 - (((missing_city + missing_district) / max(len(filtered) * 2, 1)) * 100)
-        st.metric("Data Quality Score", f"{dq_score:,.1f}%")
-        st.metric("Missing City", f"{missing_city:,}")
-        st.metric("Missing District", f"{missing_district:,}")
+        st.download_button("Export work order detail (CSV)", data=show.to_csv(index=False).encode("utf-8-sig"), file_name="workorder_detail.csv")
+
+with tab_guide:
+    st.markdown('<div class="guide-box"><div style="font-weight:700;">Dashboard Guide</div><div class="small-note">This page explains how the main metrics are calculated in the dashboard.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="guide-box"><b>Region</b><br>Region is mapped to macro regions (Western, Southern, Eastern, Northern) using the raw Region value from the service-tool sheet. City and District come from the District sheet.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="guide-box"><b>Effective Target Date</b><br>Updated Target Date is used when available. Otherwise, Targeted Completion is used. This is the final date used for overdue and forecast-risk logic.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="guide-box"><b>Lag %</b><br>Lag % = max(0, 100 - Percentage of Completion). It shows the remaining completion gap for incomplete work orders.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="guide-box"><b>Overdue Work Orders</b><br>A work order is overdue when Effective Target Date is before today and Percentage of Completion is below 100%.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="guide-box"><b>Total Rejections</b><br>Total Rejections = PIP rejection count + PAT rejection count + Approval rejection count + As-Built Rejection Count + Handover Rejection Count.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="guide-box"><b>Number of Deviations</b><br>This is the sum of deviation counts from the Penalties tab. It is different from deducted penalty amount because not all deviations have penalties applied.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="guide-box"><b>Penalty Deduction Amount</b><br>Penalty Deduction Amount is the sum of deducted values only from the Penalties tab.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="guide-box"><b>PMO Follow-up Link Codes</b><br>A link code appears in the PMO follow-up list when Updates is below 5, the latest system update is older than 5 days, and progress is still below 100%.</div>', unsafe_allow_html=True)
