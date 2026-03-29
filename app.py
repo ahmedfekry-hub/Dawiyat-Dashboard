@@ -188,36 +188,44 @@ st.markdown(
 def clean_col_name(col):
     return str(col).strip()
 
+
 def safe_series(df, col, default=np.nan):
     if col in df.columns:
         return df[col]
     return pd.Series([default] * len(df), index=df.index)
 
+
 def to_datetime_series(s):
     return pd.to_datetime(s, errors="coerce")
 
+
 def to_numeric_series(s):
     return pd.to_numeric(s, errors="coerce")
+
 
 def percent(n, d):
     if d in [0, None] or pd.isna(d):
         return 0.0
     return (n / d) * 100
 
+
 def fmt_int(x):
     if pd.isna(x):
         return "0"
     return str(int(round(float(x))))
+
 
 def fmt_money(x):
     if pd.isna(x):
         return "SAR 0"
     return f"SAR {x:,.0f}"
 
+
 def fmt_pct(x):
     if pd.isna(x):
         return "0.0%"
     return f"{x:.1f}%"
+
 
 def normalize_text(x):
     if pd.isna(x):
@@ -227,6 +235,7 @@ def normalize_text(x):
         return np.nan
     return val
 
+
 def pick_first_valid(*vals):
     for v in vals:
         if pd.notna(v):
@@ -235,8 +244,10 @@ def pick_first_valid(*vals):
                 return s
     return np.nan
 
+
 def current_ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
+
 
 # =========================================================
 # LOAD DATA
@@ -248,7 +259,7 @@ def load_data():
             f"'{DATA_FILE}' not found. Upload this file to your GitHub repo in the same folder as app.py"
         )
 
-    xls = pd.ExcelFile(DATA_FILE)
+    pd.ExcelFile(DATA_FILE)
 
     service = pd.read_excel(DATA_FILE, sheet_name="Dawaiyat Service Tool")
     district = pd.read_excel(DATA_FILE, sheet_name="District ")
@@ -297,8 +308,6 @@ def load_data():
     for c in district_map.columns:
         if district_map[c].dtype == object:
             district_map[c] = district_map[c].apply(normalize_text)
-
-    district_map.rename(columns={"District": "District"}, inplace=True)
 
     # Build mapping by Link Code first, then Work Order
     link_map = {}
@@ -622,9 +631,6 @@ with tabs[0]:
     avg_progress = filter_df["Percentage of Completion"].fillna(0).mean()
     avg_civil = filter_df["civil_completion_pct"].fillna(0).mean()
     avg_fiber = filter_df["fiber_completion_pct"].fillna(0).mean()
-    overdue_count = int(((filter_df["Effective Target Date"].notna()) &
-                         (filter_df["Effective Target Date"] < pd.Timestamp.today().normalize()) &
-                         (filter_df["Percentage of Completion"].fillna(0) < 100)).sum())
 
     c1, c2, c3, c4 = st.columns(4)
     cards = [
@@ -863,8 +869,6 @@ with tabs[2]:
         (filter_df["Percentage of Completion"].fillna(0) < 100)
     ].copy()
 
-    cancelled_count = int(filter_df["Work Order Status"].astype(str).str.contains("cancel", case=False, na=False).sum())
-    inprogress_count = int(filter_df["Work Order Status"].astype(str).str.contains("progress", case=False, na=False).sum())
     critical_lag_count = int((filter_df["lag_pct"].fillna(0) >= 15).sum())
     total_rej = filter_df["total_rejections"].fillna(0).sum()
 
