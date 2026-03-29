@@ -73,24 +73,24 @@ st.markdown(
         font-weight: 700 !important;
     }
 
-    div[data-baseweb="select"] > div {
-        background: #ffffff !important;
+    section[data-testid="stSidebar"] div[data-baseweb="select"] > div {
+        background: #f8fbff !important;
         border-radius: 12px !important;
         min-height: 46px !important;
-        border: 1px solid #dce6f5 !important;
-        color: #111827 !important;
-        font-weight: 700 !important;
+        border: 1px solid #c9d9f2 !important;
+        color: #0f172a !important;
+        font-weight: 800 !important;
+        box-shadow: inset 0 0 0 1px rgba(15,23,42,0.02) !important;
     }
 
-    div[data-baseweb="select"] span {
-        color: #111827 !important;
-        font-weight: 700 !important;
+    section[data-testid="stSidebar"] div[data-baseweb="select"] span,
+    section[data-testid="stSidebar"] div[data-baseweb="select"] input,
+    section[data-testid="stSidebar"] div[data-baseweb="select"] div,
+    section[data-testid="stSidebar"] div[data-baseweb="select"] svg {
+        color: #0f172a !important;
+        fill: #0f172a !important;
+        font-weight: 800 !important;
         opacity: 1 !important;
-    }
-
-    div[data-baseweb="select"] input {
-        color: #111827 !important;
-        font-weight: 700 !important;
     }
 
     .sidebar-title {
@@ -291,7 +291,7 @@ def load_data():
             data[c] = to_numeric_series(data[c])
 
     # Date conversions
-    date_cols = ["Created", "Assigned at", "In Progress at", "Targeted Completion", "Updated Target Date", "Closed at"]
+    date_cols = ["Created", "Assigned at", "In Progress at", "Targeted Completion", "Updated Target Date", "Closed at", "Updated"]
     for c in date_cols:
         if c in data.columns:
             data[c] = to_datetime_series(data[c])
@@ -483,13 +483,19 @@ def load_data():
         p["Region"] = p["Region"].apply(normalize_region)
 
     # -------------------------
+    data["last_updated_days"] = np.where(
+        data["Updated"].notna(),
+        (today - data["Updated"].dt.normalize()).dt.days,
+        np.nan,
+    )
+
     # PMO SUMMARY BASE (LINK CODE LEVEL)
     # -------------------------
     summary_cols = [
         "Link Code", "Work Order", "Region_final", "City_final", "District_final",
         "Percentage of Completion", "Updated", "Updates", "WO Cost", "Cost",
         "Targeted Completion", "Updated Target Date", "Effective Target Date",
-        "Work Order Status", "lag_days", "lag_pct", "forecast_risk", "total_rejections",
+        "Work Order Status", "lag_days", "lag_pct", "forecast_risk", "total_rejections", "last_updated_days",
     ]
     summary_cols = [c for c in summary_cols if c in data.columns]
 
@@ -502,10 +508,18 @@ def load_data():
         1, 0
     )
 
-    # Needs update
+    # Needs update: only active records with progress and a target in or before the next 2 months
+    two_month_limit = today + pd.DateOffset(months=2)
+    pmo["relevant_target_window"] = np.where(
+        ((pmo["Targeted Completion"].notna()) & (pmo["Targeted Completion"] <= two_month_limit)) |
+        ((pmo["Updated Target Date"].notna()) & (pmo["Updated Target Date"] <= two_month_limit)),
+        1, 0,
+    )
     pmo["needs_update_followup"] = np.where(
+        (pmo["Percentage of Completion"].fillna(0) > 0) &
         (pmo["Updates"].fillna(0) < 5) &
-        (pmo["Updated"].fillna(0) > 5),
+        (pmo["last_updated_days"].fillna(-1) > 5) &
+        (pmo["relevant_target_window"] == 1),
         1, 0
     )
 
@@ -727,6 +741,7 @@ with tabs[1]:
             "lag_pct": "max",
             "best_flag": "max",
             "needs_update_followup": "max",
+            "last_updated_days": "min",
         })
         .reset_index()
     )
@@ -773,13 +788,13 @@ with tabs[1]:
 
     with a1:
         st.markdown('<div class="section-title">Link Codes Requiring Update</div>', unsafe_allow_html=True)
-        show_cols = ["Link Code", "Region_final", "City_final", "District_final", "Percentage of Completion", "Updates", "Updated", "Effective Target Date", "lag_pct"]
+        show_cols = ["Link Code", "Region_final", "City_final", "District_final", "Percentage of Completion", "Updates", "last_updated_days", "Effective Target Date", "lag_pct"]
         show_cols = [c for c in show_cols if c in followup_df.columns]
         followup_show = followup_df[show_cols].copy()
         if "Percentage of Completion" in followup_show.columns:
             followup_show.rename(columns={"Percentage of Completion": "Avg Progress %"}, inplace=True)
-        if "Updated" in followup_show.columns:
-            followup_show.rename(columns={"Updated": "Last Updated (Days)"}, inplace=True)
+        if "last_updated_days" in followup_show.columns:
+            followup_show.rename(columns={"last_updated_days": "Last Updated (Days)"}, inplace=True)
         if "Region_final" in followup_show.columns:
             followup_show.rename(columns={"Region_final": "Region"}, inplace=True)
         if "City_final" in followup_show.columns:
@@ -817,7 +832,7 @@ with tabs[1]:
 
     targeted_monthly = (
         cost_base.dropna(subset=["Targeted Completion"])
-        .assign(Month=cost_base["Targeted Completion"].dt.to_period("M").astype(str))
+        .assign(Month=cost_base["Targeted Completion"].dt.strftime("%b%Y"))
         .groupby("Month", dropna=False)["Cost"]
         .sum()
         .reset_index(name="Targeted Completion Cost")
@@ -825,14 +840,16 @@ with tabs[1]:
 
     updated_monthly = (
         cost_base.dropna(subset=["Updated Target Date"])
-        .assign(Month=cost_base["Updated Target Date"].dt.to_period("M").astype(str))
+        .assign(Month=cost_base["Updated Target Date"].dt.strftime("%b%Y"))
         .groupby("Month", dropna=False)["Cost"]
         .sum()
         .reset_index(name="Updated Target Date Cost")
     )
 
     monthly_cost = pd.merge(targeted_monthly, updated_monthly, on="Month", how="outer").fillna(0)
-    monthly_cost = monthly_cost.sort_values("Month")
+    if not monthly_cost.empty:
+        monthly_cost["Month_sort"] = pd.to_datetime(monthly_cost["Month"], format="%b%Y", errors="coerce")
+        monthly_cost = monthly_cost.sort_values("Month_sort").drop(columns=["Month_sort"])
 
     if not monthly_cost.empty:
         fig_cost = go.Figure()
